@@ -1,6 +1,6 @@
 # Pictures for the moai-3hgm pull request
 
-This branch holds only the pictures of the pull request "moai daemon — write methods (moai-3hgm)" to `buzzni/moai:daemonize`, and the scripts that made them. It shares no history with moai and is never merged. The pull request links each picture by the commit of this branch, so do not rewrite it.
+This branch holds only the pictures of the pull request "moai daemon — write methods (moai-3hgm)" to `buzzni/moai:milestone/moai-w3sx`, and the scripts that made them. It shares no history with moai and is never merged. The pull request links each picture by the commit of this branch, so do not rewrite it.
 
 | File | What it shows |
 |---|---|
@@ -12,7 +12,7 @@ This branch holds only the pictures of the pull request "moai daemon — write m
 
 ## How they were made
 
-The screenshots are a real run of the branch's release binary (`moai 0.48.0` at the head of `worktree-moai-3hgm`) in a demo repository, Lantern, that `scripts/site-demo/seed.sh` builds. Nothing on them was typed by hand or edited afterwards.
+The screenshots are a real run of the branch's release binary (`moai 0.51.0` at the head of `worktree-moai-3hgm`) in a demo repository, Lantern, that `scripts/site-demo/seed.sh` builds. Nothing on them was typed by hand or edited afterwards.
 
     MOAI=<moai with daemon> SEED=<moai>/scripts/site-demo/seed.sh make/record.sh casts
     make/render.sh casts raw
