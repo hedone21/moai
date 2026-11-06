@@ -104,7 +104,9 @@ thread_local! {
 #[cfg(unix)]
 fn ctl_never_reaches_the_runners_sockets() {
     use std::os::unix::net::UnixListener;
-    let s = Scratch::new("ctl-xdg");
+    // 소켓을 세우는 자리다 — `CTL_FENCE` 와 같은 까닭으로 `/tmp` 아래 짧게 둔다(macOS 의 상한은 104 바이트다).
+    let s = Scratch(Path::new("/tmp").join(format!("moai-xdg-{}", std::process::id())));
+    std::fs::create_dir(s.path()).unwrap();
     let xdg = s.path().join("moai");
     std::fs::create_dir(&xdg).unwrap();
     let socket = xdg.join("9999.sock");
@@ -122,12 +124,95 @@ fn ctl_never_reaches_the_runners_sockets() {
 }
 
 #[test]
+fn layered_sort_and_group_are_available_to_json_clients() {
+    let s = init("layered-group");
+    let rows = [
+        r#"{"id":"argos-m001","title":"later","kind":"milestone","status":"todo","created_at":"2026-09-01T00:00:00Z","updated_at":"2026-09-01T00:00:00Z","status_since":"2026-09-01T00:00:00Z","due_on":"2026-12-01"}"#,
+        r#"{"id":"argos-m002","title":"earlier","kind":"milestone","status":"todo","created_at":"2026-09-02T00:00:00Z","updated_at":"2026-09-02T00:00:00Z","status_since":"2026-09-02T00:00:00Z","due_on":"2026-11-01"}"#,
+        r#"{"id":"argos-a001","title":"one","status":"todo","priority":2,"assignee":"Zoe","milestone":"argos-m002","created_at":"2026-09-01T00:00:00Z","updated_at":"2026-09-01T00:00:00Z","status_since":"2026-09-01T00:00:00Z"}"#,
+        r#"{"id":"argos-a002","title":"two","status":"todo","priority":0,"assignee":"Ada","milestone":"argos-m002","created_at":"2026-09-02T00:00:00Z","updated_at":"2026-09-02T00:00:00Z","status_since":"2026-09-02T00:00:00Z"}"#,
+    ];
+    std::fs::write(s.path().join(".moai/issues.jsonl"), format!("{}\n", rows.join("\n"))).unwrap();
+    let tree: serde_json::Value = serde_json::from_str(&ok(
+        s.path(),
+        &["tui", "--deep", "--no-gantt", "--sort", "milestone=due;item=priority", "--json"],
+    ))
+    .unwrap();
+    let ids: Vec<_> = tree.as_array().unwrap().iter().filter_map(|r| r["id"].as_str()).collect();
+    assert_eq!(ids, ["argos-m002", "argos-a002", "argos-a001", "argos-m001"]);
+    let grouped: serde_json::Value =
+        serde_json::from_str(&ok(s.path(), &["tui", "--deep", "--no-gantt", "--group", "assignee", "--json"])).unwrap();
+    let headers: Vec<_> = grouped.as_array().unwrap().iter().filter(|r| r["kind"] == "group").collect();
+    assert_eq!(headers.iter().map(|r| r["title"].as_str().unwrap()).collect::<Vec<_>>(), ["Ada", "Zoe"]);
+    let path = headers[0]["path"].as_str().unwrap();
+    let inside: serde_json::Value =
+        serde_json::from_str(&ok(s.path(), &["tui", "--group", "assignee", "--path", path, "--json"])).unwrap();
+    assert_eq!(inside.as_array().unwrap()[0]["id"], "argos-a002");
+    // `--sort id` alone would put Zoe's argos-a001 first (and the default puts Ada's p0 first anyway), so only
+    // the group can order Ada before Zoe here.
+    let sorted: serde_json::Value =
+        serde_json::from_str(&ok(s.path(), &["show", "--sort", "id", "--group", "assignee", "--json"])).unwrap();
+    let titles: Vec<_> = sorted.as_array().unwrap().iter().filter_map(|r| r["assignee"].as_str()).collect();
+    assert_eq!(titles, ["Ada", "Zoe"]);
+    // A flat list only orders by the group — a kind-filtered list must not come back empty.
+    let stones: serde_json::Value =
+        serde_json::from_str(&ok(s.path(), &["milestone", "show", "--group", "status", "--json"])).unwrap();
+    assert_eq!(stones.as_array().unwrap().len(), 2, "{stones}");
+    // `--path` still narrows a grouped tree: the later milestone holds no work, so it has no group.
+    let empty: serde_json::Value = serde_json::from_str(&ok(
+        s.path(),
+        &["tui", "--deep", "--no-gantt", "--group", "assignee", "--path", "argos-m001", "--json"],
+    ))
+    .unwrap();
+    assert_eq!(empty.as_array().unwrap().len(), 0, "{empty}");
+}
+
+#[test]
+fn dangling_group_references_use_the_explorer_position_in_show() {
+    let s = init("dangling-group");
+    // The lost rows' ids sort after the rows with no group (review moai-6vcm.xdf). Grouped by the written id, a
+    // dangling `argos-e999` sorts between the real group and the ungrouped tail, so with the lost rows first by id
+    // the old order matched the tree by chance and the epic half could not go red.
+    let rows = [
+        r#"{"id":"argos-e001","title":"epic","kind":"epic","status":"todo","created_at":"2026-09-01T00:00:00Z","updated_at":"2026-09-01T00:00:00Z","status_since":"2026-09-01T00:00:00Z"}"#,
+        r#"{"id":"argos-m001","title":"milestone","kind":"milestone","status":"todo","created_at":"2026-09-01T00:00:00Z","updated_at":"2026-09-01T00:00:00Z","status_since":"2026-09-01T00:00:00Z"}"#,
+        r#"{"id":"argos-a009","title":"lost epic","epic":"argos-e999","status":"todo","created_at":"2026-09-01T00:00:00Z","updated_at":"2026-09-01T00:00:00Z","status_since":"2026-09-01T00:00:00Z"}"#,
+        r#"{"id":"argos-a008","title":"lost milestone","milestone":"argos-m999","status":"todo","created_at":"2026-09-01T00:00:00Z","updated_at":"2026-09-01T00:00:00Z","status_since":"2026-09-01T00:00:00Z"}"#,
+        r#"{"id":"argos-a003","title":"valid epic","epic":"argos-e001","status":"todo","created_at":"2026-09-01T00:00:00Z","updated_at":"2026-09-01T00:00:00Z","status_since":"2026-09-01T00:00:00Z"}"#,
+        r#"{"id":"argos-a004","title":"valid milestone","milestone":"argos-m001","status":"todo","created_at":"2026-09-01T00:00:00Z","updated_at":"2026-09-01T00:00:00Z","status_since":"2026-09-01T00:00:00Z"}"#,
+    ];
+    std::fs::write(s.path().join(".moai/issues.jsonl"), format!("{}\n", rows.join("\n"))).unwrap();
+    for group in ["epic", "milestone"] {
+        let show: serde_json::Value = serde_json::from_str(&ok(
+            s.path(),
+            &["show", "--type", "issue", "--sort", "id", "--group", group, "--json"],
+        ))
+        .unwrap();
+        let tree: serde_json::Value = serde_json::from_str(&ok(
+            s.path(),
+            &["tui", "--deep", "--no-gantt", "--sort", "id", "--group", group, "--json"],
+        ))
+        .unwrap();
+        let ids = |v: &serde_json::Value| {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["kind"] == "issue")
+                .map(|r| r["id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&show).len(), 4, "show={show}");
+        assert_eq!(ids(&show), ids(&tree), "group={group}; show={show}; tree={tree}");
+    }
+}
+
+#[test]
 fn ctl_state_without_a_window_says_no_window() {
     let s = Scratch::new("ctl-empty");
     let output = moai(s.path(), &["ctl", "state", "--json"]);
     assert!(!output.status.success());
     let json: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
-    assert_eq!(json["code"], if cfg!(unix) { "no_window" } else { "unsupported" });
+    assert_eq!(json["code"], if cfg!(any(unix, windows)) { "no_window" } else { "unsupported" });
 }
 
 #[test]
@@ -177,7 +262,7 @@ fn ctl_lists_and_reads_an_open_explorer() {
     impl Drop for Child {
         fn drop(&mut self) {
             let _ = self.0.kill();
-            let _ = self.0.wait();
+            reap(&mut self.0);
         }
     }
     let mut child = Child(command.spawn().unwrap());
@@ -207,11 +292,12 @@ fn ctl_lists_and_reads_an_open_explorer() {
         std::thread::sleep(Duration::from_millis(30));
     }
     let id = window_id.unwrap_or_else(|| panic!("explorer did not register: {shown}"));
+    keep_reading_pty(&master);
     assert_eq!(id, format!("tui-{}", child.0.id()));
     let out = ok(s.path(), &["ctl", "state", "--json"]);
     let json: serde_json::Value = serde_json::from_str(&out).unwrap();
     assert_eq!(json["screen"], "list");
-    assert_eq!(json["sort"], serde_json::json!(["priority"]));
+    assert_eq!(json["sort"], serde_json::json!(["priority", "due"]));
     let pressed = ok(s.path(), &["ctl", "keys", "SPC g b", "--json"]);
     assert_eq!(serde_json::from_str::<serde_json::Value>(&pressed).unwrap()["screen"], "board");
     assert_eq!(
@@ -222,6 +308,10 @@ fn ctl_lists_and_reads_an_open_explorer() {
     assert_eq!(serde_json::from_str::<serde_json::Value>(&done).unwrap()["screen"], "list");
     let actions = ok(s.path(), &["ctl", "actions", "--json"]);
     assert!(actions.contains("browse.read_all"), "{actions}");
+    let by_id = ok(s.path(), &["ctl", "sort", "id", "--json"]);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&by_id).unwrap()["sort"], serde_json::json!(["id"]));
+    let grouped = ok(s.path(), &["ctl", "group", "assignee", "--json"]);
+    assert_eq!(serde_json::from_str::<serde_json::Value>(&grouped).unwrap()["group"], "assignee");
     let sorted = ok(s.path(), &["ctl", "sort", "title:desc,priority:desc", "--json"]);
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&sorted).unwrap()["sort"],
@@ -264,6 +354,39 @@ fn ctl_lists_and_reads_an_open_explorer() {
     assert!(!socket.exists());
 }
 
+/// 창이 뜬 뒤로도 진짜 터미널처럼 master 를 읽는다 — macOS 의 pty 는 출력 칸이 1KB 남짓이라, 안 읽으면 그리던 탐색기가
+/// `write` 에서 막혀 ctl 에 답을 못 한다(`no_window`, os error 35). 슬레이브가 닫히면 끝난다.
+#[cfg(unix)]
+fn keep_reading_pty(master: &std::fs::File) {
+    use std::io::Read;
+    let mut master = master.try_clone().unwrap();
+    std::thread::spawn(move || {
+        let mut buf = [0; 8192];
+        loop {
+            match master.read(&mut buf) {
+                Ok(0) => return,
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                Err(_) => return,
+            }
+        }
+    });
+}
+
+/// 죽인 pty 자식을 기다린다 — **시한이 있다.** macOS 는 안 읽은 출력이 pty 에 남으면 master 가 닫힐 때까지 프로세스가 끝나기를
+/// 미룬다. master 는 이 값보다 늦게 떨어져, 막는 `wait` 는 시험을 영영 안 끝냈다(moai-3e4m).
+#[cfg(unix)]
+fn reap(child: &mut std::process::Child) {
+    for _ in 0..40 {
+        if !matches!(child.try_wait(), Ok(None)) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 #[cfg(unix)]
 struct ProposalPtyChild(std::process::Child);
 
@@ -271,7 +394,7 @@ struct ProposalPtyChild(std::process::Child);
 impl Drop for ProposalPtyChild {
     fn drop(&mut self) {
         let _ = self.0.kill();
-        let _ = self.0.wait();
+        reap(&mut self.0);
     }
 }
 
@@ -335,6 +458,7 @@ fn proposal_pty(name: &str) -> (Scratch, std::fs::File, ProposalPtyChild) {
         }
         let windows = json_of(&ok(scratch.path(), &["ctl", "ls", "--json"]));
         if windows["windows"].as_array().is_some_and(|rows| !rows.is_empty()) {
+            keep_reading_pty(&master);
             return (scratch, master, child);
         }
         std::thread::sleep(Duration::from_millis(30));
@@ -6444,13 +6568,11 @@ fn show_orders_the_list_by_the_key_it_is_given() {
         args.extend_from_slice(extra);
         ids_in(&ok(s.path(), &args))
     };
-    // 같은 우선순위끼리는 id 로 가른다 — id 는 무작위라 시험이 제 손으로 가른다.
-    let by_id = |a: &str, b: &str| if a < b { [a.to_string(), b.to_string()] } else { [b.to_string(), a.to_string()] };
-    let [p2a, p2b] = by_id(&banana, &cherry);
+    // Equal priority falls to creation time, then id.
 
     assert_eq!(
         order(&[]),
-        [epic.clone(), apple.clone(), p2a.clone(), p2b.clone(), member.clone()],
+        [epic.clone(), apple.clone(), banana.clone(), cherry.clone(), member.clone()],
         "기본 차례가 바뀌었다"
     );
     assert_eq!(order(&["--sort", "priority"]), order(&[]), "`priority` 가 기본 차례와 다르다");
@@ -6473,7 +6595,7 @@ fn show_orders_the_list_by_the_key_it_is_given() {
     // 적힌 칸으로 재면 p0 인 에픽이 `todo` 의 맨 앞에 선다.
     assert_eq!(
         order(&["--sort", "status"]),
-        [apple.clone(), p2a.clone(), p2b.clone(), epic.clone(), member.clone()],
+        [banana.clone(), apple.clone(), cherry.clone(), epic.clone(), member.clone()],
         "칸 차례가 묶음의 읽은 칸을 안 봤다"
     );
 
@@ -6497,7 +6619,7 @@ fn show_orders_the_list_by_the_key_it_is_given() {
     ok_at(s.path(), "2026-09-20T00:00:00Z", &["edit", &banana, "--title", "Banana 고침"]);
     assert_eq!(
         order(&["--sort", "updated"]),
-        [banana.clone(), member.clone(), epic.clone(), cherry.clone(), apple.clone()],
+        [banana.clone(), epic.clone(), member.clone(), cherry.clone(), apple.clone()],
         "고친 차례가 아니다"
     );
 }
@@ -9647,6 +9769,9 @@ fn idea_and_issue_share_one_list_of_verbs() {
 const JSON_SWEEP: &[&str] = &[
     "image",
     "ctl",
+    // 사용자당 하나인 데몬(moai-5n6m.x8t). 훑기는 `status` 만 부른다 — `start` 는 멈출 때까지 안 돌아온다.
+    // 격리된 `MOAI_CTL_DIR` 에는 데몬이 없어 `running:false` 객체 하나와 0 이다. 띄우고 멈추는 길은 `tests/daemon.rs`.
+    "daemon",
     "watch",
     "supervise",
     "writing",
@@ -10471,6 +10596,7 @@ fn every_command_still_speaks_json() {
         ],
         vec!["image", "add", "sweep.gif", "--json"],
         vec!["ctl", "ls", "--json"],
+        vec!["daemon", "status", "--json"],
         vec!["writing", "--json"],
         vec!["status", "--json"],
         vec!["ready", "--json"],
@@ -10516,6 +10642,13 @@ fn every_command_still_speaks_json() {
         vec!["due", "apply", "--dry-run", "--json"],
         vec!["due", "apply", "--json"],
     ];
+    // With no window, the new ctl words must still return a structured JSON refusal.
+    for args in [vec!["ctl", "sort", "release", "--json"], vec!["ctl", "group", "assignee", "--json"]] {
+        let output = moai(s.path(), &args);
+        assert!(!output.status.success());
+        let value: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert!(value.get("code").is_some());
+    }
     // **적어 둔 목록과 실제로 부르는 목록을 여기서 잇는다.** 잇지 않으면
     // `JSON_SWEEP` 에 이름만 적고 한 번도 안 부르는 명령이 생기고, 그러면
     // 위 시험은 초록인데 그 명령의 `--json` 은 아무도 안 본 것이 된다 —
@@ -14519,11 +14652,15 @@ fn promote_human_preview_names_bodies_without_writing() {
     // 넘치는 `--body` 는 연습도 진짜도 거절한다 — 연습이 그 글을 재지 않으면 사람이 "좋다" 한 뒤에 진짜가 물린다.
     let big = "x".repeat(70_000);
     for dry in [true, false] {
-        let mut argv = vec!["backlog", "promote", idea.as_str(), "--from", "-", "--body", big.as_str()];
+        let plan = p.join("oversize-plan.md");
+        std::fs::write(&plan, "# new epic\n- sole\n").unwrap();
+        // 글은 stdin 으로 준다 — Windows 의 명령줄은 32K 에서 끊겨 70K 의 인자가 안 닿는다.
+        let plan = plan.display().to_string();
+        let mut argv = vec!["backlog", "promote", idea.as_str(), "--from", plan.as_str(), "--body", "-"];
         if dry {
             argv.push("--dry-run");
         }
-        let out = from_stdin(p, &argv, "# new epic\n- sole\n");
+        let out = from_stdin(p, &argv, &big);
         assert!(!out.status.success(), "dry_run={dry}: 넘치는 --body 를 받았다");
     }
     assert_eq!(issues(p), before);
@@ -14798,8 +14935,13 @@ fn promote_speaks_json_too() {
 fn the_agents_block_teaches_idea() {
     let s = init("agentsidea");
     let block = std::fs::read_to_string(s.path().join("AGENTS.md")).unwrap();
-    for want in ["moai backlog add", "moai backlog ls", "moai backlog promote", "moai defer"] {
+    for want in ["moai backlog add", "moai defer", "references/commands.md"] {
         assert!(block.contains(want), "{want} 가 없다 — {block}");
+    }
+    ok(s.path(), &["skill", "install", "--agent", "codex"]);
+    let reference = read(&s.path().join(".agents/skills/moai/references/commands.md"));
+    for want in ["moai backlog add", "moai backlog ls", "moai backlog promote", "moai defer"] {
+        assert!(reference.contains(want), "{want} missing from reference");
     }
 }
 
@@ -14807,6 +14949,9 @@ fn the_agents_block_teaches_idea() {
 fn the_agents_block_teaches_ctl_without_mv() {
     let s = init("agentsctl");
     let block = std::fs::read_to_string(s.path().join("AGENTS.md")).unwrap();
+    assert!(block.contains("Explorer control") && block.contains("references/commands.md"));
+    ok(s.path(), &["skill", "install", "--agent", "codex"]);
+    let reference = read(&s.path().join(".agents/skills/moai/references/commands.md"));
     for want in [
         "moai ctl ls",
         "moai ctl state",
@@ -14815,9 +14960,12 @@ fn the_agents_block_teaches_ctl_without_mv() {
         "--take -m 'accepted proposal <proposal id> in the explorer'",
         "moai ctl read` only on request",
     ] {
-        assert!(block.contains(want), "{want} is missing from the managed block");
+        assert!(reference.contains(want), "{want} is missing from the reference");
     }
-    assert!(!block.contains("moai ctl mv") && !block.contains("moai ctl note"), "tracker writes became ctl verbs");
+    assert!(
+        !reference.contains("moai ctl mv") && !reference.contains("moai ctl note"),
+        "tracker writes became ctl verbs"
+    );
 }
 
 /// **마크다운은 `idea add` 로 들어오지 않는다.** `#` 이 에픽이고 `-` 가
@@ -30117,7 +30265,7 @@ fn init_screen_defaults_install_the_hooks_and_skills() {
     impl Drop for Child {
         fn drop(&mut self) {
             let _ = self.0.kill();
-            let _ = self.0.wait();
+            reap(&mut self.0);
         }
     }
     let mut child = Child(command.spawn().unwrap());
@@ -32533,6 +32681,36 @@ fn update_runs_install_sh_over_the_running_binary() {
     server.join().unwrap();
 }
 
+/// The installed executable is probed only after a successful installer, and its result reaches update's output.
+#[cfg(unix)]
+#[test]
+fn update_probes_the_new_binary_only_after_success() {
+    if !served() {
+        return;
+    }
+    for code in [0, 3] {
+        let s = Scratch::new("update-daemon-probe");
+        let exe = hoisted(s.path());
+        let marker = s.path().join("probed");
+        let replacement = s.path().join("replacement");
+        std::fs::write(&replacement, format!(
+            "#!/bin/sh\nprintf probed > '{}'\nprintf '%s\\n' '{{\"running\":true,\"same_version\":false,\"version\":\"old\",\"pid\":42}}'\n",
+            marker.display()
+        )).unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = format!("mv '{}' '{}'\nexit {code}\n", replacement.display(), exe.display());
+        let (url, server) = serving_script(script, 1);
+        let out =
+            update_with(&exe, s.path(), &s.path().join("config.toml"), &[("MOAI_INSTALL_URL", &url)], &["--json"]);
+        server.join().unwrap();
+        assert_eq!(out.status.code(), Some(code), "{}", text(&out));
+        let result: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(marker.exists(), code == 0);
+        assert_eq!(result.get("daemon_restart").and_then(|v| v.as_bool()), (code == 0).then_some(true));
+    }
+}
+
 /// **받을 저장소는 사용자 설정에서 오고 `MOAI_REPO` 가 이긴다. 저장소의 `.moai/config.toml` 은 안 읽는다**
 /// (moai-zsfr.2em, 사람 결정 2026-10-08) — 클론한 저장소가 셸에 흘릴 스크립트를 고르면 안 된다.
 #[cfg(unix)]
@@ -33011,7 +33189,7 @@ fn next_event_stamp(reader: &mut std::io::BufReader<std::net::TcpStream>) -> Str
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn event_named(reader: &mut std::io::BufReader<std::net::TcpStream>, want: &str) -> serde_json::Value {
     use std::io::BufRead as _;
     let mut event = String::new();
@@ -33029,7 +33207,7 @@ fn event_named(reader: &mut std::io::BufReader<std::net::TcpStream>, want: &str)
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn ctl_post(port: u16, path: &str, body: &str, content_type: &str, token: bool) -> (u16, String) {
     use std::io::{Read as _, Write as _};
     let mut stream = dial(port);
@@ -33042,7 +33220,7 @@ fn ctl_post(port: u16, path: &str, body: &str, content_type: &str, token: bool) 
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn web_ctl_lists_a_visible_tab_and_reads_its_state() {
     let s = init("web-ctl-tab");
     let web = serve(s.path());
@@ -33080,7 +33258,7 @@ fn web_ctl_lists_a_visible_tab_and_reads_its_state() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn web_ctl_reply_needs_origin_token_and_json() {
     let s = init("web-ctl-reply-guard");
     let web = serve(s.path());
@@ -33098,7 +33276,7 @@ fn web_ctl_reply_needs_origin_token_and_json() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn web_ctl_reply_body_is_capped() {
     use std::io::{Read as _, Write as _};
     let s = init("web-ctl-cap");
@@ -33124,7 +33302,7 @@ fn a_body_on_any_other_path_is_still_refused() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn web_ctl_gone_when_the_stream_ends() {
     let s = init("web-ctl-gone");
     let web = serve(s.path());
@@ -33142,7 +33320,7 @@ fn web_ctl_gone_when_the_stream_ends() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn web_ctl_propose_reaches_a_tab_and_returns_its_answer() {
     let s = init("web-ctl-propose");
     let web = serve(s.path());
@@ -33194,7 +33372,7 @@ fn web_ctl_propose_reaches_a_tab_and_returns_its_answer() {
 /// A given `--user` is given (`model::actor`): `propose` refuses a malformed one the way every other ctl verb does,
 /// instead of putting an unsigned card in front of the person (review moai-4xmq.sqe 6).
 #[test]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn web_ctl_propose_refuses_a_malformed_user_before_any_card() {
     let s = init("web-ctl-propose-bad-user");
     let web = serve(s.path());
@@ -33212,7 +33390,7 @@ fn web_ctl_propose_refuses_a_malformed_user_before_any_card() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn web_ctl_plan_applies_the_requested_day() {
     let s = init("web-ctl-caller");
     let issue = field(&ok(s.path(), &["add", "planned row", "--json"]), "id");
@@ -33244,7 +33422,7 @@ fn web_ctl_plan_applies_the_requested_day() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn web_ctl_write_refuses_a_request_without_an_actor() {
     let s = init("web-ctl-no-actor");
     let issue = field(&ok(s.path(), &["add", "planned row", "--json"]), "id");
@@ -33317,7 +33495,7 @@ fn web_events_refuse_a_foreign_host() {
 }
 
 #[test]
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn web_events_reserve_the_slot_until_a_tab_resumes_or_its_grace_ends() {
     let s = init("web-events-reserved-resume");
     let web = serve(s.path());
@@ -33341,35 +33519,6 @@ fn web_events_reserve_the_slot_until_a_tab_resumes_or_its_grace_ends() {
     assert_eq!(event_named(&mut resumed, "proposal")["id"], card["id"]);
     assert_eq!(get(web.port, "/api/stamp").0, 200);
     drop(others);
-}
-
-// Windows streams have no ctl identity to reserve, so anonymous capacity returns immediately.
-#[test]
-#[cfg(not(unix))]
-fn web_events_give_their_slot_back_when_the_tab_goes() {
-    let s = init("web-events-release");
-    let web = serve(s.path());
-    let mut streams = Vec::new();
-    for _ in 0..3 {
-        let mut stream = events(web.port);
-        next_event_stamp(&mut stream);
-        streams.push(stream);
-    }
-    drop(streams);
-    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let mut stream = dial(web.port);
-        use std::io::{Read as _, Write as _};
-        write!(stream, "GET /api/events HTTP/1.1\r\nHost: 127.0.0.1:{}\r\n\r\n", web.port).unwrap();
-        stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
-        let mut start = [0; 12];
-        stream.read_exact(&mut start).unwrap();
-        if &start == b"HTTP/1.1 200" {
-            break;
-        }
-        assert!(std::time::Instant::now() < until, "closed streams did not return their slots");
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
 }
 
 /// 본문 없는 POST 하나 — `Origin` 을 줄 때만 싣는다. 브라우저가 보내는 꼴이다(읽음 표시, moai-ly88).
@@ -33473,6 +33622,11 @@ fn web_serves_the_page_and_the_boot() {
     assert!(boot["filter_keys"].as_array().unwrap().iter().any(|k| k == "due_on"), "{boot}");
     assert!(boot["sort_fields"].as_array().unwrap().iter().any(|f| f["name"] == "due" && f["dir"] == "asc"), "{boot}");
     assert!(boot["sort_fields"].as_array().unwrap().iter().any(|f| f["name"] == "created" && f["dir"] == "desc"));
+    assert_eq!(boot["sort_layers"], serde_json::json!(["milestone", "epic", "item"]));
+    assert!(boot["sort_groups"].as_array().unwrap().iter().any(|g| g == "assignee"));
+    let people = boot["sort_presets"].as_array().unwrap().iter().find(|p| p["name"] == "people").unwrap();
+    assert_eq!(people["group"], "assignee");
+    assert!(people["order"].as_str().unwrap().contains("item=priority,due"));
     assert!(boot["columns"]["backlog"]["name"].is_string(), "{boot}");
 
     let (status, _, body) = get(web.port, "/api/status");
@@ -34568,7 +34722,7 @@ fn local_heartbeat_surfaces_lost_alive_unknown_and_disabled_without_tracker_writ
     std::fs::write(picks.join("heartbeat-session"), format!("100\t{id}\t{}\n", 1789099923)).unwrap(); // NOW's tracker clock
     let beat = beat_dir.join("heartbeat-session");
     let age = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
-    std::fs::File::open(&beat).unwrap().set_modified(age).unwrap();
+    std::fs::File::options().write(true).open(&beat).unwrap().set_modified(age).unwrap();
     let show = || {
         let out = call(&["show", &id, "--json"]);
         assert!(out.status.success());
@@ -34600,7 +34754,7 @@ fn local_heartbeat_surfaces_lost_alive_unknown_and_disabled_without_tracker_writ
     assert!(filtered.get("session").is_none());
     let human = call(&["show", &id]);
     assert!(String::from_utf8_lossy(&human.stdout).contains("→  claude --resume"));
-    std::fs::File::open(&beat).unwrap().set_modified(std::time::SystemTime::now()).unwrap();
+    std::fs::File::options().write(true).open(&beat).unwrap().set_modified(std::time::SystemTime::now()).unwrap();
     assert_eq!(show()["session"]["state"], "alive");
     assert_eq!(show()["session"]["recover"], serde_json::json!([]));
     std::fs::remove_file(&beat).unwrap();
@@ -34611,7 +34765,7 @@ fn local_heartbeat_surfaces_lost_alive_unknown_and_disabled_without_tracker_writ
     hook_at_home(&s, s.path(), None, &[], "pre-tool-use", &input);
     assert!(!beat.exists());
     std::fs::write(&beat, "claude\tStop\n").unwrap();
-    std::fs::File::open(&beat).unwrap().set_modified(age).unwrap();
+    std::fs::File::options().write(true).open(&beat).unwrap().set_modified(age).unwrap();
     assert!(show().get("session").is_none());
     assert_eq!(issues(s.path()), snapshot);
     for (path, bytes) in journal_before {
@@ -34651,7 +34805,9 @@ fn terminal_takeover_clears_a_lost_session_without_a_new_pick() {
     // A real ordering nonce with a fixed tracker-clock stamp; MOAI_NOW and mtime deliberately use different clocks.
     let nonce = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
     std::fs::write(&record, format!("{nonce}\t{id}\t1789099923\n")).unwrap();
-    std::fs::File::open(&beat)
+    std::fs::File::options()
+        .write(true)
+        .open(&beat)
         .unwrap()
         .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
         .unwrap();
@@ -34944,6 +35100,112 @@ fn conditional_dates_recheck_after_waiting_for_the_write_lock() {
     assert_eq!(issues(s.path()), changed);
 }
 
+/// **쓰기의 도장은 락을 쥔 뒤에 뜬다**(moai-3hgm.pp2, 리뷰 moai-5n6m.e9f 의 1). `note`·`defer`·`rm`·`add`·`add --from`·
+/// `link` 가 시각을 락 밖에서 뜨던 판은, 락을 기다린 쓰기가 기다리기 전의 도장으로 저널과 스냅샷에 섰다.
+///
+/// 시계를 고정하면 값이 같아 못 가르므로 실제 시계로 돈다([`staged_live`]). 쓰기마다 우리가 락을 쥐고 띄워, 그 쓰기가
+/// 락을 연 것을 본 뒤(`/proc/<pid>/fd`) 그 초 `o` 를 재고, 시계가 다음 초로 넘어갈 때까지 쥐었다가 놓는다. 락 밖에서
+/// 뜬 도장은 락을 열기 전이라 `o` 이하이고, 락을 쥔 뒤에 뜬 도장은 그 쓰기의 놓은 초 `released`(> `o`) 이상이다.
+///
+/// **쓰기는 하나씩 락 뒤에 세운다**(리뷰 moai-3hgm.puw 6번). `store` 의 락 기다림(5초)이 세는 것은 락을 연 뒤부터
+/// 쥘 때까지라, 하나씩이면 그 사이는 "열었다" 를 본 틈과 다음 초까지의 1초 남짓이다 — 바쁜 기계에서 프로세스가 늦게
+/// 떠도 그 늦음은 락을 열기 전이라 안 센다. 여섯을 함께 띄워 모두가 열기를 4초까지 기다리던 판은, 먼저 연 쓰기가 그
+/// 4초와 다음 초까지의 1초에 앞선 쓰기들이 락을 쥔 몫까지 기다려 바쁜 기계에서 5초를 넘기고 `locked` 로 넘어질 수
+/// 있었다.
+#[cfg(target_os = "linux")]
+#[test]
+fn writes_stamp_the_time_after_the_lock_is_acquired() {
+    use fs2::FileExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+    let secs = || SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
+    let s = init("stamp-after-lock");
+    let noted = add(s.path(), &["노트 달 줄"]);
+    let deferred = add(s.path(), &["미룰 줄"]);
+    let removed = add(s.path(), &["지울 줄"]);
+    let blocker = add(s.path(), &["막는 줄"]);
+    let blocked = add(s.path(), &["막힐 줄"]);
+    let plan = s.path().join("plan.md");
+    std::fs::write(&plan, "# 기다린 에픽\n- [p2] 기다린 멤버\n").unwrap();
+    let plan = plan.to_str().unwrap().to_string();
+
+    let lock = std::fs::OpenOptions::new().read(true).write(true).open(s.path().join(".moai/lock")).unwrap();
+    let held = lock.metadata().unwrap();
+    let opened = |pid: u32| {
+        std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| std::fs::metadata(entry.path()).ok())
+            .any(|file| file.dev() == held.dev() && file.ino() == held.ino())
+    };
+    // 쓰기 하나를 우리가 쥔 락 뒤에 세우고, 그 쓰기가 락을 연 다음 초에 놓는다 — 놓은 초를 돌려준다.
+    let behind_the_lock = |what: &str, args: &[&str]| -> i64 {
+        lock.lock_exclusive().unwrap();
+        let mut child = staged_live(args)
+            .current_dir(s.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        // 락을 열기 전은 쓰기의 기다림에 안 세니 넉넉히 기다린다 — 바쁜 기계에서 프로세스가 늦게 떠도 된다.
+        let until = Instant::now() + Duration::from_secs(60);
+        while !opened(child.id()) {
+            assert!(child.try_wait().unwrap().is_none(), "{what} exited before reaching the write lock");
+            assert!(Instant::now() < until, "{what} never reached the held lock");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // 락을 연 것을 본 뒤에 잰 초 — 락 밖에서 뜬 도장은 이 초를 못 넘는다.
+        let o = secs();
+        while secs() <= o {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let released = secs();
+        FileExt::unlock(&lock).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(out.status.success(), "{what} failed: {}", String::from_utf8_lossy(&out.stderr));
+        released
+    };
+    let note_at = behind_the_lock("note", &["note", &noted, "기다린 노트"]);
+    let defer_at = behind_the_lock("defer", &["defer", &deferred, "-m", "기다린 미루기"]);
+    let rm_at = behind_the_lock("rm", &["rm", &removed]);
+    let add_at = behind_the_lock("add", &["add", "기다린 만들기"]);
+    let plan_at = behind_the_lock("add --from", &["add", "--from", &plan]);
+    let link_at = behind_the_lock("link", &["link", &blocker, "--blocks", &blocked]);
+
+    let at = |ts: &str| moai::model::parse_rfc3339(ts).unwrap_or_else(|| panic!("bad stamp {ts}"));
+    let lines: Vec<serde_json::Value> = journal(s.path()).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let stamp = |kind: &str, released: i64, pick: &dyn Fn(&serde_json::Value) -> bool| -> String {
+        let e = lines.iter().find(|e| e["kind"] == kind && pick(e)).unwrap_or_else(|| panic!("no {kind} line"));
+        let ts = e["ts"].as_str().unwrap().to_string();
+        assert!(at(&ts) >= released, "{kind} {e} was stamped before the lock was released ({released})");
+        ts
+    };
+    stamp("note", note_at, &|e| e["id"] == noted.as_str() && e["text"] == "기다린 노트");
+    stamp("rm", rm_at, &|e| e["id"] == removed.as_str());
+    let why = stamp("note", defer_at, &|e| e["id"] == deferred.as_str() && e["text"] == "기다린 미루기");
+    let made = stamp("create", add_at, &|e| e["title"] == "기다린 만들기");
+    stamp("create", plan_at, &|e| e["title"] == "기다린 에픽");
+    stamp("create", plan_at, &|e| e["title"] == "기다린 멤버");
+
+    let rows: Vec<serde_json::Value> = issues(s.path()).lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let row = |pick: &dyn Fn(&serde_json::Value) -> bool| rows.iter().find(|r| pick(r)).unwrap().clone();
+    // 한 쓰기의 도장은 한 순간이다 — 저널과 스냅샷이 같은 값을 든다.
+    let d = row(&|r| r["id"] == deferred.as_str());
+    assert_eq!(
+        (&d["deferred_at"], &d["planned_at"], &d["updated_at"]),
+        (&why.clone().into(), &why.clone().into(), &why.into())
+    );
+    let m = row(&|r| r["title"] == "기다린 만들기");
+    assert_eq!(
+        (&m["created_at"], &m["updated_at"], &m["status_since"]),
+        (&made.clone().into(), &made.clone().into(), &made.into())
+    );
+    let b = row(&|r| r["id"] == blocked.as_str());
+    assert!(at(b["updated_at"].as_str().unwrap()) >= link_at, "link stamped before the lock was released: {b}");
+}
+
 #[test]
 fn supervisor_watch_resumes_same_second_and_generates_assignment() {
     let s = init("supervisor-watch");
@@ -35021,6 +35283,38 @@ fn supervisor_watch_resumes_same_second_and_generates_assignment() {
     let expected =
         message.replace("from: supervisor", &format!("First {id}\nRoot {}\nfrom: supervisor", s.path().display()));
     assert_eq!(String::from_utf8(configured.stdout).unwrap(), expected);
+    // Literal strings, comments, trailing commas and multiline arrays are TOML, not JSON.
+    std::fs::write(
+        &config_path,
+        format!("{original}\n[supervise]\nextra_lines = [\n  'First <id>', # a comment\n  \"Root <root>\",\n]\n"),
+    )
+    .unwrap();
+    let configured = send(id);
+    assert!(configured.status.success(), "{}", String::from_utf8_lossy(&configured.stderr));
+    assert_eq!(String::from_utf8(configured.stdout).unwrap(), expected);
+    assert!(moai(s.path(), &["status"]).status.success(), "valid multiline TOML broke status");
+    // A comment after the value is TOML too — the JSON reader accepted `["…"] # note` once the comment was cut.
+    // A leading-comma element holding `=` is an element, not a new assignment.
+    for commented in [
+        "extra_lines = [\"First <id>\", \"Root <root>\"] # note".to_string(),
+        "extra_lines = [\n  \"First <id>\",\n  \"Root <root>\",\n] # end".to_string(),
+        "extra_lines = [\n  \"First <id>\"\n  , \"Root <root>\"\n]".to_string(),
+    ] {
+        std::fs::write(&config_path, format!("{original}\n[supervise]\n{commented}\n")).unwrap();
+        let configured = send(id);
+        assert!(configured.status.success(), "{commented}: {}", String::from_utf8_lossy(&configured.stderr));
+        assert_eq!(String::from_utf8(configured.stdout).unwrap(), expected, "{commented}");
+        assert!(moai(s.path(), &["status"]).status.success(), "{commented} broke status");
+    }
+    std::fs::write(
+        &config_path,
+        format!("{original}\n[supervise]\nextra_lines = [\n  \"First <id>\"\n  , \"a = b\"\n]\n"),
+    )
+    .unwrap();
+    let configured = send(id);
+    assert!(configured.status.success(), "{}", String::from_utf8_lossy(&configured.stderr));
+    assert!(String::from_utf8_lossy(&configured.stdout).contains("\na = b\nfrom: supervisor"));
+    assert!(moai(s.path(), &["status"]).status.success(), "an element holding = broke status");
     std::fs::write(&config_path, format!("{original}\n[supervise]\nextra_lines = []\n")).unwrap();
     assert_eq!(send(id).stdout, message.as_bytes());
     std::fs::write(&config_path, format!("{original}\n[supervise]\nextra_lines = 42\n")).unwrap();

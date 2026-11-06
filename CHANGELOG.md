@@ -12,6 +12,57 @@ does not tag — see `CONTRIBUTING.md`.
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-11-06
+
+### Added
+- `moai daemon` and `moai ctl` run on Windows, over a named pipe open to your account alone. `moai ctl` reaches an open explorer or web tab there, Ctrl-C stops the daemon cleanly, and `moai update` names a running daemon of another version. See `docs/daemon.md`. (moai-0yo3)
+
+- `moai daemon start|stop|status` runs a per-user local daemon in the foreground (systemd, launchd or `&` keep it) and serves a JSON-RPC 2.0 API over a Unix socket (`daemon.socket` beside the `moai ctl` sockets): the reads `status`, `ready`, `prime`, `show`, `stats`, `project.ls` and a `changes` poll, and the writes `add` (`kind` picks `epic add`, `milestone add` or `backlog add`), `mv`, `edit`, `note`, `defer`, `rm` and `link`, each returning the CLI's `--json` answer for a registered project in an envelope with `messages`, `partial` and the CLI's `exit` code. A write runs the CLI's own code under the same lock; its author is the request's `actor`, else the project's git config, else it fails with `no_actor`. Moving someone else's row is not refused: the CLI's notice comes back in `messages`, and hook rule 5 does not apply to the API. Plans (`add --from`, `backlog promote`) are not served. There is no network access. The CLI does not use the daemon: it still reads and writes `.moai/` directly and works with none running. See `docs/daemon.md`. (moai-5n6m, moai-3hgm)
+- The daemon stops cleanly on SIGTERM and SIGINT, as it does on `moai daemon stop`: it removes its socket, lets a running write finish and a running read go on for up to 5 seconds, and exits 0. A request that arrives while it stops gets `-32000` with `data.code` `stopping` and does not run. A signal already ignored at startup stays ignored. (moai-ou5y.gfs, moai-3hgm.uz0)
+- Daemon `changes` reports issue edits only: session heartbeats and clock-driven fields are not edits, and a live row that could not be read is not reported as removed. Requests without an actor use the project's Git identity rather than the daemon's `MOAI_ACTOR`. (moai-wbdh)
+- `moai update` reports a running daemon with a different version or protocol after a successful update; `--json` then includes `daemon_restart: true`. A rebuild of the same version is not detected. Restart remains under the user or service manager's control. (moai-ou5y.q6t)
+
+### Fixed
+- `moai ctl` reports `busy`, not that the window is gone, when a window runs out of control client slots just as a request reaches it. (moai-t0ys.0dk)
+- The skill's one-liner that pulls a review's text out of a subagent transcript reads and writes UTF-8 on Windows. It stopped on Korean text under the default code page. (moai-6ld5.ew1)
+- The editor opens the right file when `TEMP` is on a network share on Windows. A jot could be lost when cmd.exe could not start in the share. (moai-dgcz)
+- Windows builds carry an 8 MiB stack, as Linux does. The default 1 MiB overflowed in development builds. (moai-6ld5.535)
+
+- `moai status`, `show`, `prime`, `project`, `add`, `mv`, `edit`, `defer`, `rm` and `backlog promote` no longer panic when stderr is closed (a broken pipe) while they print a notice; the notice is dropped and the answer still comes out. (moai-5n6m, moai-3hgm.25e)
+- `moai note`, `defer`, `rm`, `link`, `add` (with `--from` too), `wiki learn` and the explorer’s `SPC n` take their timestamp after they hold the tracker lock, not before, so a write that waited for another one no longer goes into the journal and the snapshot (`updated_at`, `created_at`, `deferred_at`) with the earlier time. (moai-3hgm.pp2)
+
+## [0.51.0] - 2026-11-05
+
+### Added
+
+- Group work with `--group` or `moai ctl group`, choose layered `--sort` expressions or presets, and sort by the new kind, milestone, epic, tag, started, done, starts, since and progress fields. The explorer and web have a combined sort and group window. Urgent, recent and due presets use a flat view; people groups by assignee and orders work by priority and due date. Layered TUI settings use `order_layers`, with the item order also written to the legacy `order` array. (moai-ctxc, moai-okdc)
+
+### Changed
+
+- Default release order is now layer-specific: milestones by due date then newest creation, epics by priority then creation, and work by priority then due date. Milestones and epics precede issues in `moai show` and `/api/rows`. Missing values remain last even for `due:desc`; ties always use creation then id. `--reverse` reverses field directions without reversing null placement or ties. (moai-ctxc, moai-okdc)
+
+### Fixed
+
+- `show --group epic` and `--group milestone` group rows with missing references consistently with the explorer. (moai-6vcm)
+- Web sort and grouping changes avoid redundant reads; a manual refresh remains available during a read and fetches fresh data afterward. (moai-wrod)
+
+## [0.50.0] - 2026-11-04
+
+### Changed
+
+- The web list and kanban fill unused space below their content with a subtle hatch, including when groups are folded. (moai-v0h5)
+
+### Fixed
+
+- Rule 5 takeover suggestions name every affected owner and preserve all requested IDs; layer refreshes no longer repeat unchanged read diagnostics, and `show` honors unreadable live IDs over stale archived copies when judging groups. (moai-8rf1)
+- `[supervise] extra_lines` accepts TOML arrays, including multiline arrays, literal strings, trailing commas and comments. Multiline arrays stop every command in v0.49 and earlier binaries; upgrade those binaries before using them. JSON-only escapes such as `\/` are now refused. (moai-8rf1)
+
+## [0.49.0] - 2026-11-04
+
+### Changed
+
+- The moai block `moai init` writes into AGENTS.md now keeps only the standing rules (about 45KB down to 6KB); the detail moved to the `moai` skill's `references/commands.md`. The supervisor and worker steps split their rarer branches into separate reference files, so a subagent worker reads about 35KB instead of 51KB. Run `moai init` and `moai skill install` again to pick it up. (moai-w0zr)
+
 ## [0.48.0] - 2026-11-04
 
 ### Added

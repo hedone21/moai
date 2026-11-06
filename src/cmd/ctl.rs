@@ -36,7 +36,7 @@ pub fn propose(
         ));
     }
     let then = then_cmd.as_deref().map(then_verb).transpose()?.map(Box::new);
-    unix_only()?;
+    control_available()?;
     let windows = call::windows_for_target(target)?;
     let window = window_for(ctx, &windows, target)?;
     let mut request = wire::request(wire::Verb::Propose { text, then, ttl, wait }, Duration::from_secs(wait + 10));
@@ -54,7 +54,7 @@ pub fn answer(ctx: &Ctx, target: Option<&str>, id: String, wait: u64) -> R<Vec<S
     if wait > 3600 {
         return Err(Fail::coded("--wait must be at most 3600 seconds", code::BAD_INPUT));
     }
-    unix_only()?;
+    control_available()?;
     let target = target.or_else(|| id.rsplit_once('/').map(|(w, _)| w));
     let windows = call::windows_for_proposal(target)?;
     let window = window_for(ctx, &windows, target)?;
@@ -63,7 +63,7 @@ pub fn answer(ctx: &Ctx, target: Option<&str>, id: String, wait: u64) -> R<Vec<S
 }
 
 pub fn withdraw(ctx: &Ctx, target: Option<&str>, id: String) -> R<Vec<String>> {
-    unix_only()?;
+    control_available()?;
     let target = target.or_else(|| id.rsplit_once('/').map(|(w, _)| w));
     let windows = call::windows_for_proposal(target)?;
     let window = window_for(ctx, &windows, target)?;
@@ -86,8 +86,12 @@ fn window_for<'a>(ctx: &Ctx, windows: &'a [call::Window], target: Option<&str>) 
 
 /// A command that needs a window says `unsupported` where no window can listen, as `state` and the verbs do; `ls`
 /// alone answers an empty list there.
-fn unix_only() -> R<()> {
-    if cfg!(unix) { Ok(()) } else { Err(Fail::coded("control sockets are unavailable on this OS", code::UNSUPPORTED)) }
+fn control_available() -> R<()> {
+    if cfg!(any(unix, windows)) {
+        Ok(())
+    } else {
+        Err(Fail::coded("control sockets are unavailable on this OS", code::UNSUPPORTED))
+    }
 }
 
 fn proposal_reply(ctx: &Ctx, reply: wire::Reply) -> R<Vec<String>> {
@@ -122,6 +126,9 @@ fn then_verb(text: &str) -> R<wire::Verb> {
         CtlCmd::Do { name, target: None } => wire::Verb::Do { name },
         CtlCmd::Sort { words, default, target: None } => {
             wire::Verb::Sort { words: words.split(',').map(str::to_owned).collect(), default }
+        }
+        CtlCmd::Group { group, target: None } => {
+            wire::Verb::Sort { words: vec![format!("group={}", group.name())], default: false }
         }
         CtlCmd::Filter { query, clear, target: None } if clear != query.is_some() => wire::Verb::Filter { query },
         CtlCmd::Find { query, scope, target: None } => wire::Verb::Find { query, scope },
@@ -184,12 +191,12 @@ fn split_words(text: &str) -> R<Vec<String>> {
 }
 
 pub fn state(ctx: &Ctx, target: Option<&str>, rows: bool) -> R<Vec<String>> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (ctx, target, rows);
         Err(Fail::coded("control sockets are unavailable on this OS", code::UNSUPPORTED))
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let windows = call::windows_for_target(target)?;
         let window = window_for(ctx, &windows, target)?;
@@ -257,8 +264,12 @@ fn validate_verb(verb: &wire::Verb) -> R<()> {
     use wire::Verb;
     let bad = |message: &str| Fail::coded(message, code::BAD_INPUT);
     match verb {
-        Verb::Sort { words, .. } if crate::tui::App::sorting_of(words).is_none() => {
-            return Err(bad("invalid explorer order; use title, priority, status, or another explorer field, not id"));
+        Verb::Sort { words, .. } => {
+            let raw = words.join(",");
+            let valid_group = raw.strip_prefix("group=").is_some_and(|s| s.parse::<crate::nav::Group>().is_ok());
+            if !valid_group && crate::query::Order::parse(&raw).is_err() {
+                return Err(bad("invalid explorer order or group"));
+            }
         }
         Verb::Find { scope, .. } if crate::query::GrepIn::named(scope).is_none() => {
             return Err(bad("--in must be all, id, title, tag, body, or note"));
@@ -303,12 +314,12 @@ fn verb_request(ctx: &Ctx, target: Option<&str>, verb: wire::Verb) -> R<Vec<Stri
 }
 
 fn invoke(ctx: &Ctx, target: Option<&str>, verb: wire::Verb, needs_actor: bool) -> R<Vec<String>> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (ctx, target, verb, needs_actor);
         Err(Fail::coded("control sockets are unavailable on this OS", code::UNSUPPORTED))
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let windows = call::windows_for_target(target)?;
         let window = window_for(ctx, &windows, target)?;
@@ -403,7 +414,9 @@ mod proposal_tests {
         assert!(then_verb("keys SPC a y").is_err());
         assert!(then_verb("propose hello").is_err());
         assert!(then_verb("screen missing").is_err());
-        assert!(then_verb("sort id").is_err());
+        assert!(then_verb("sort id").is_ok());
+        assert!(then_verb("sort not-a-field").is_err());
+        assert!(then_verb("group assignee").is_ok());
         assert!(then_verb("theme neon").is_err());
     }
 }

@@ -4,11 +4,11 @@
 
 `moai ctl ls --all` includes other repositories. Without `--all`, `ls` lists only windows in the current repository. A missing window gives `no_window` for `state`; it never silently chooses a window in another repository. From outside a repository, the most recently used window across repositories is the default.
 
-The transport is a Unix socket in `MOAI_CTL_DIR`, otherwise `$XDG_RUNTIME_DIR/moai`, otherwise the system temporary directory's `moai-<uid>` folder. The folder must belong to your user and have no group or other access. The socket is `<pid>.sock`; no metadata file is written. The listener removes its socket on exit, and discovery cleans up stale sockets only after verifying their type and owner. Requests and replies are one JSON object per line, limited to 1 MiB. Requests carry `proto: 1`; unknown versions are refused.
+The transport is a Unix socket in `MOAI_CTL_DIR`, otherwise `$XDG_RUNTIME_DIR/moai`, otherwise on Windows `moai/run` under `%LOCALAPPDATA%`, otherwise the system temporary directory's `moai-<uid>` folder. The folder must belong to your user and have no group or other access. The socket is `<pid>.sock`; no metadata file is written. The listener removes its socket on exit, and discovery cleans up stale sockets only after verifying their type and owner. Requests and replies are one JSON object per line, limited to 1 MiB. Requests carry `proto: 1`; unknown versions are refused.
 
 The server admits up to three visible event streams per browser at once, and 32 across every browser together; a page tells its browser apart by a random id kept in IndexedDB (in local storage when IndexedDB is unavailable), and pages that cannot keep one share a single budget. Extra tabs keep browsing through two-second polling and retry a stream every 30 seconds; until admitted, they are absent from `ctl ls` and cannot receive ctl requests or new proposals. This leaves browser connections available for reads and proposal replies. A web tab admitted to ctl holds one event stream while it is visible. Hiding or closing the tab ends that stream and removes its id from `ctl ls`; its slot remains reserved for its 30-second reconnect grace, so overflow tabs cannot take it; a ctl request already sent to it returns `gone`. A tab whose stream comes back within 30 seconds (shown again, or reconnecting after the server's thirty-minute stream end or a worktree toggle) keeps its id, token and pending suggestions, and calls waiting on those suggestions keep waiting. Otherwise those waiting calls get `gone` once the 30 seconds pass, and the tab gets a new id and token when it shows again. The server sends ctl requests through that stream and accepts a JSON reply only from the same-origin page with the tab token; it limits the reply body to 1 MiB. If the local ctl socket cannot open, the web page still serves normally and the server says why on stderr.
 
-On Windows, `ctl ls` returns an empty list and commands that need a window report `unsupported`. Named pipes remain to be designed.
+On Windows the transport is a named pipe open to your account alone, and each window leaves a `<pid>.sock` file holding the pipe's name in the same directory, so `ctl ls` finds windows the same way. An explorer sees a request within about 50 ms. A caller cannot shut down its writing side and still read the reply; keep the pipe open until the answer arrives.
 
 ## Press keys and run actions
 
@@ -36,7 +36,8 @@ These commands act on the selected open window. Use `-t <id>` to choose one expl
 
 | Command | Example | Effect |
 |---|---|---|
-| `sort` | `moai ctl sort 'title:desc,priority:desc'` | Set the current project's order; `--default` also changes the default. |
+| `sort` | `moai ctl sort 'milestone=created:desc;item=priority,due'` | Set layer-specific order or choose a preset such as `release`; `--default` also changes the default. |
+| `group` | `moai ctl group assignee` | Group the list and board by a field; `structure` restores the tree and `none` makes a flat list. |
 | `filter` | `moai ctl filter 'status=todo tag=parser'` | Apply a filter; `--clear` removes it. |
 | `find` | `moai ctl find 'parser' --in title` | Search `all`, `id`, `title`, `tag`, `body`, or `note`. |
 | `screen` | `moai ctl screen board` | Open `list`, `board`, `gantt`, `stats`, or `wiki`. |
@@ -68,4 +69,4 @@ If a waiting command closes its connection, its waiter slot is released promptly
 
 A window holds up to five pending suggestions, including reserved actions still awaiting their result. Text is limited to 500 characters and three lines, with control characters removed. `--ttl` defaults to 900 seconds and is limited to 3600; an unanswered suggestion expires and disappears. Answered suggestions remain readable for ten minutes. Waiting callers have four slots separate from ordinary ctl requests, so a set of unanswered suggestions does not stop `state` from answering.
 
-Decided in: moai-zgc1 moai-v5of moai-4km9 moai-4xmq
+Decided in: moai-zgc1 moai-v5of moai-4km9 moai-4xmq moai-okdc

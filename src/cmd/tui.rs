@@ -79,7 +79,11 @@ pub fn run(ctx: &Ctx, args: TuiArgs) -> R<Vec<String>> {
     drop(root);
     crate::tui::watch(&mut watched, places);
     crate::tui::watch(&mut watched, archived_marks);
-    let path = resolve(&index, &load.issues, args.path.as_deref(), ctx.lang())?;
+    let path = if ctx.json && args.path.as_deref().is_some_and(|p| p.starts_with("group:")) {
+        Vec::new()
+    } else {
+        resolve(&index, &load.issues, args.path.as_deref(), ctx.lang())?
+    };
 
     // `--json` 은 화면을 켜지 않는다. 기계로 읽는 쪽과 통합 시험이 이 길로 온다.
     if ctx.json {
@@ -113,7 +117,7 @@ pub fn run(ctx: &Ctx, args: TuiArgs) -> R<Vec<String>> {
         let rows: Vec<Row> = entries
             .into_iter()
             .map(|(e, home)| {
-                let mut row = Row::of(&index, &load.issues, &states, &e, home, ctx.lang());
+                let mut row = Row::of_grouped(&index, &load.issues, &states, &e, home, ctx.lang());
                 row.gantt = gantt.as_ref().zip(e.at()).and_then(|(g, at)| g.get(&at));
                 row
             })
@@ -540,6 +544,7 @@ fn resolve(index: &Index, issues: &[Issue], want: Option<&str>, lang: crate::i18
 fn shaped(args: &TuiArgs) -> Option<&'static str> {
     super::show::first_given(&args.filter)
         .or_else(|| args.order.sort.is_some().then_some("--sort"))
+        .or_else(|| args.order.group.is_some().then_some("--group"))
         .or_else(|| args.order.reverse.then_some("--reverse"))
         .or_else(|| args.deep.then_some("--deep"))
         .or_else(|| args.no_archive.then_some("--no-archive"))
@@ -565,14 +570,9 @@ fn listing(
     (index, ground): (&Index, &crate::tui::Ground),
     path: &Path,
     args: TuiArgs,
-) -> R<Vec<(Entry, Option<Vec<String>>)>> {
-    let TuiArgs { path: _, filter, order, deep, worktree: _, no_archive, no_gantt: _ } = args;
+) -> R<Vec<(crate::nav::GroupedEntry, Option<Vec<String>>)>> {
+    let TuiArgs { path: requested_path, filter, order, deep, worktree: _, no_archive, no_gantt: _ } = args;
     let given = super::show::first_given(&filter).is_some();
-    if !given && order.sort.is_none() && !order.reverse && !no_archive {
-        // 거르개도 차례도 없으면 `Index::entries` 의 그 자다 — 다 남기고 목록의 차례로.
-        let by = |a: usize, b: usize| crate::query::display_order(&issues[a], &issues[b]);
-        return Ok(spread(index, issues, path, deep, &|_| true, &by));
-    }
     let kind = filter.kind;
     let filter = super::show::filter_of(ctx, repo, issues, filter, kind)?;
     let notes = filter.grep.is_some().then(|| {
@@ -592,23 +592,70 @@ fn listing(
         (!given || filter.matches(&issues[at], &now, &wh))
             && (!no_archive || !(ground.archive_copy(issues, at) || wh.archived(&issues[at], &now)))
     };
-    let fields = order.sort.map(|f| f.0);
+    let group = order.group.or_else(|| order.sort.as_ref().and_then(|s| s.1)).unwrap_or_default();
+    let selected = order.sort.map(|f| f.0).unwrap_or_default();
+    let context = crate::query::SortContext::with_where(issues, &wh);
     let cfg = &repo.config;
-    let by = |a: usize, b: usize| match &fields {
-        Some(fields) => crate::query::order_by(
-            fields,
-            order.reverse,
-            (&issues[a], wh.column(&issues[a])),
-            (&issues[b], wh.column(&issues[b])),
-            &cfg.statuses,
-            cfg.naming,
-        ),
-        None => {
-            let o = crate::query::display_order(&issues[a], &issues[b]);
-            if order.reverse { o.reverse() } else { o }
+    let by = |a: usize, b: usize| {
+        let pair = ((&issues[a], wh.column(&issues[a])), (&issues[b], wh.column(&issues[b])));
+        if group == crate::nav::Group::Structure {
+            context.compare_layers(&selected, order.reverse, pair.0, pair.1, &cfg.statuses, cfg.naming)
+        } else {
+            context.compare(&selected.item, order.reverse, pair.0, pair.1, &cfg.statuses, cfg.naming)
         }
     };
-    Ok(spread(index, issues, path, deep, &keep, &by))
+    if group == crate::nav::Group::Structure && requested_path.as_deref().is_some_and(|p| p.starts_with("group:")) {
+        return Err(Fail::coded("group path requires its matching --group", super::code::BAD_INPUT));
+    }
+    if group == crate::nav::Group::Structure {
+        return Ok(spread(index, issues, path, deep, &keep, &by)
+            .into_iter()
+            .map(|(e, home)| (crate::nav::GroupedEntry::Entry(e), home))
+            .collect());
+    }
+    let requested_group = requested_path
+        .as_deref()
+        .filter(|p| p.starts_with("group:"))
+        .map(parse_group_handle)
+        .transpose()
+        .map_err(|why| Fail::coded(why, super::code::BAD_INPUT))?;
+    if requested_group.as_ref().is_some_and(|k| k.group != group) {
+        return Err(Fail::coded("group path requires its matching --group", super::code::BAD_INPUT));
+    }
+    let rows = index.grouped_tree(issues, path, &keep, &by, group, &cfg.statuses, &|_| deep, &|_| {
+        deep || requested_group.is_some()
+    });
+    if let Some(want) = requested_group {
+        let mut selected = false;
+        let mut found = false;
+        let mut out = Vec::new();
+        for (entry, _) in rows {
+            match entry {
+                crate::nav::GroupedEntry::Header(key) => {
+                    selected = key == want;
+                    found |= selected;
+                }
+                other if selected => out.push((other, deep.then(|| vec![group_handle(&want)]))),
+                _ => {}
+            }
+        }
+        if !found {
+            return Err(Fail::not_found(&group_handle(&want), ctx.lang()));
+        }
+        return Ok(out);
+    }
+    let mut group_path: Option<String> = None;
+    Ok(rows
+        .into_iter()
+        .map(|(entry, twig)| {
+            if let crate::nav::GroupedEntry::Header(key) = &entry {
+                group_path = Some(group_handle(key));
+            }
+            let home =
+                deep.then(|| if twig.depth() > 0 { group_path.clone().into_iter().collect() } else { Vec::new() });
+            (entry, home)
+        })
+        .collect())
 }
 
 /// 한 자리의 목록을 그대로 내거나(`--deep` 아님), 탐색기가 **다 펼친 나무** 그대로 낸다(moai-0aa7.joy) — 폴더
@@ -649,7 +696,22 @@ fn handle(seg: &Seg) -> String {
         Seg::Milestone(Some(id)) | Seg::Epic(id) | Seg::Issue(id) => id.clone(),
         Seg::Milestone(None) => NO_MILESTONE.into(),
         Seg::Lost => LOST.into(),
+        Seg::Group(key) => group_handle(key),
     }
+}
+
+fn parse_group_handle(raw: &str) -> Result<crate::nav::GroupKey, String> {
+    let (group, value) = raw.strip_prefix("group:").and_then(|s| s.split_once(':')).ok_or("invalid group path")?;
+    let group = group.parse::<crate::nav::Group>()?;
+    if matches!(group, crate::nav::Group::Structure | crate::nav::Group::None) {
+        return Err("invalid group path".into());
+    }
+    let value = serde_json::from_str(value).map_err(|_| "invalid group path".to_string())?;
+    Ok(crate::nav::GroupKey { group, value })
+}
+
+fn group_handle(key: &crate::nav::GroupKey) -> String {
+    format!("group:{}:{}", key.group.name(), serde_json::to_string(&key.value).expect("group value serializes"))
 }
 
 /// `--json` 한 줄의 원소. 파일의 키 순서와 같은 뜻으로 앞에서부터 읽힌다.
@@ -697,6 +759,42 @@ struct Tally {
 }
 
 impl<'g> Row<'g> {
+    fn of_grouped(
+        index: &Index,
+        issues: &[Issue],
+        states: &std::collections::BTreeMap<crate::report::GroupKey<'_>, &str>,
+        e: &crate::nav::GroupedEntry,
+        home: Option<Vec<String>>,
+        lang: crate::i18n::Lang,
+    ) -> Row<'g> {
+        match e {
+            crate::nav::GroupedEntry::Entry(entry) => Self::of(index, issues, states, entry, home, lang),
+            crate::nav::GroupedEntry::Header(key) => Row {
+                id: None,
+                title: key
+                    .value
+                    .as_deref()
+                    .map(|value| {
+                        if matches!(key.group, crate::nav::Group::Milestone | crate::nav::Group::Epic) {
+                            index.find(value).map(|at| issues[at].title.clone()).unwrap_or_else(|| value.to_string())
+                        } else {
+                            value.to_string()
+                        }
+                    })
+                    .unwrap_or_else(|| "(none)".into()),
+                kind: "group",
+                dir: true,
+                path: group_handle(key),
+                status: None,
+                derived_status: None,
+                priority: None,
+                progress: None,
+                home,
+                gantt: None,
+            },
+        }
+    }
+
     fn of(
         index: &Index,
         issues: &[Issue],
@@ -1496,11 +1594,15 @@ fn msys_command(sh: &std::path::Path, editor: &str, path: &std::path::Path) -> s
 ///
 /// 8.3 짧은 이름은 안 쓴다 — `'`·`{`·`}` 는 짧은 이름에도 그대로 남는다(`O'BRIE~1`, wine 에서 `O'BR~DML` 로 쟀다).
 ///
-/// **둘째 갈래가 못 닿는 자리가 하나 있다**(리뷰 moai-j9gv.8oh) — 임시 디렉터리가 UNC(`\\server\share\…`)면 `.cmd`·`.bat`
-/// 편집기(`code.cmd`)를 띄우는 `cmd.exe` 가 그 자리를 지금 자리로 못 세워 `%SystemRoot%` 로 옮겨 가([`super::program`]
-/// 의 글), 이름만 받은 편집기가 다른 파일을 연다. 그런 자리에 UNC 를 거는 판이 드물어 사람이 정할 일로 남겼다.
+/// **UNC 임시 경로는 어느 갈래도 안 탄다**(moai-dgcz, 리뷰 moai-j9gv.8oh) — `\\서버\공유\…` 를 그대로 넘긴다. `code.cmd` 를 띄우는
+/// `cmd.exe` 가 UNC 를 지금 자리로 못 세워 `%SystemRoot%` 로 옮겨 가고, 이름만 받은 편집기가 다른 파일을 열어 적은 생각이
+/// 사라졌다. `/` 철자도 안 쓴다 — `//서버/…` 의 머리 `/` 를 스위치로 읽는 편집기가 있다. 대가는 MSYS2 의 `nano.exe` 다:
+/// 드문 그 자리에서만 `\` 를 못 받는다.
 #[cfg(not(unix))]
 fn editor_target(path: &std::path::Path) -> (std::path::PathBuf, Option<std::path::PathBuf>) {
+    if let Some(whole) = unc_spelling(path.as_os_str()) {
+        return (whole.into(), None);
+    }
     if let Some(spelt) = editor_spelling(path.as_os_str()) {
         return (spelt.into(), None);
     }
@@ -1510,9 +1612,16 @@ fn editor_target(path: &std::path::Path) -> (std::path::PathBuf, Option<std::pat
     (name.into(), Some(dir.to_path_buf()))
 }
 
+/// UNC 자리면 `\\?\` 를 걷은 그 철자다. 드라이브 자리는 없다.
+#[cfg(any(not(unix), test))]
+fn unc_spelling(path: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
+    let spelt = crate::path::unverbatim(path);
+    spelt.as_encoded_bytes().starts_with(br"\\").then_some(spelt)
+}
+
 /// [`editor_target`] 의 첫 갈래 — `\\?\` 를 걷고 `\` 를 `/` 로 쓴 철자([`crate::path::slashed_os`])가 싸지 않아도 MSYS2 를
 /// 그대로 지나면([`crate::tui::jotfile::msys_word`]) 그것이고, 아니면 없다. **환경도 파일도 안 봐 리눅스에서도 잰다**(리뷰
-/// moai-j9gv.8oh) — CI 는 Windows 의 시험을 짓기만 한다. 고르는 글자가 모두 ASCII 라 손실 있는 글로 봐도 UTF-16 단위로 본
+/// moai-j9gv.8oh). 고르는 글자가 모두 ASCII 라 손실 있는 글로 봐도 UTF-16 단위로 본
 /// 답과 같다.
 #[cfg(any(not(unix), test))]
 fn editor_spelling(path: &std::ffi::OsStr) -> Option<std::ffi::OsString> {
@@ -2542,9 +2651,20 @@ mod tests {
         assert_eq!(said, Vec::<String>::new(), "없는 파일을 나갈 때 댄다");
     }
 
+    /// UNC 임시 경로는 전체를 넘긴다 — 이름만 넘기면 `cmd.exe` 가 자리를 못 세워 다른 파일을 연다(moai-dgcz).
+    #[test]
+    fn a_unc_temp_path_goes_whole_and_a_drive_path_does_not() {
+        let s = |p: &str| unc_spelling(std::ffi::OsStr::new(p));
+        let whole = std::ffi::OsStr::new(r"\\fs\home$\John Smith\Temp\moai-backlog-1-0.md");
+        assert_eq!(s(r"\\fs\home$\John Smith\Temp\moai-backlog-1-0.md").as_deref(), Some(whole));
+        assert_eq!(s(r"\\?\UNC\fs\home$\John Smith\Temp\moai-backlog-1-0.md").as_deref(), Some(whole));
+        assert_eq!(s(r"C:\Users\me\Temp\moai-backlog-1-0.md"), None);
+        assert_eq!(s(r"\\?\C:\Users\me\Temp\moai-backlog-1-0.md"), None);
+    }
+
     /// **편집기가 받을 철자는 리눅스에서도 잰다**(moai-l3pp, 리뷰 moai-j9gv.8oh) — `\\?\` 를 걷고 `/` 로 쓴 `C:/…` 가 MSYS2 를
-    /// 그대로 지나면 그것이고, 아니면 없다(이름만 넘기고 자리를 옮긴다). Windows 의 갈래는 CI 가 짓기만 하므로 그 몸통을
-    /// 여기서 잰다 — 접두어를 안 걷거나, `\` 철자로 재거나, 갈래를 뒤집으면 붉어진다.
+    /// 그대로 지나면 그것이고, 아니면 없다(이름만 넘기고 자리를 옮긴다). Windows 갈래의 몸통을 어느 기계에서나 여기서
+    /// 잰다 — 접두어를 안 걷거나, `\` 철자로 재거나, 갈래를 뒤집으면 붉어진다.
     #[test]
     fn the_editor_spelling_is_slashed_unless_msys2_would_change_it() {
         let s = |p: &str| editor_spelling(std::ffi::OsStr::new(p));
